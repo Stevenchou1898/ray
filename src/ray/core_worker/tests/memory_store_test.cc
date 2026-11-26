@@ -96,6 +96,60 @@ TEST(TestMemoryStore, TestReportUnhandledErrors) {
   ASSERT_EQ(unhandled_count, 0);
 }
 
+TEST(TestMemoryStore, DeleteObjectMatchesVectorDeleteAndIsIdempotent) {
+  InstrumentedIOContextWithThread io_context("DeleteObjectMatchesVectorDelete");
+  Clock clock;
+  int unhandled_count = 0;
+  CoreWorkerMemoryStore memory_store(io_context.GetIoService(),
+                                     clock,
+                                     /*reference_counting_enabled=*/true,
+                                     nullptr,
+                                     nullptr,
+                                     [&](const RayObject &obj) { unhandled_count++; });
+
+  // DeleteObject is used by the reference-counter callback, where each ID is
+  // reported individually. It must preserve the vector overload's OnDelete hook
+  // and statistics behavior without requiring a temporary vector.
+  const ObjectID object_id = ObjectID::FromRandom();
+  RayObject obj(rpc::ErrorType::TASK_EXECUTION_EXCEPTION);
+  memory_store.Put(obj, object_id, /*has_reference=*/true);
+  ASSERT_EQ(memory_store.Size(), 1);
+
+  memory_store.DeleteObject(object_id);
+  ASSERT_EQ(memory_store.GetIfExists(object_id), nullptr);
+  ASSERT_EQ(memory_store.Size(), 0);
+  ASSERT_EQ(unhandled_count, 1);
+
+  // Reference cleanup can encounter an ID whose value has already been removed.
+  // A repeated single-ID deletion must be a no-op, including not firing OnDelete
+  // a second time.
+  memory_store.DeleteObject(object_id);
+  ASSERT_EQ(memory_store.GetIfExists(object_id), nullptr);
+  ASSERT_EQ(memory_store.Size(), 0);
+  ASSERT_EQ(unhandled_count, 1);
+
+  // The vector overload and the single-ID entry point share one implementation.
+  // Reinserting the same ID and deleting it through the batch API verifies that
+  // both paths continue to update the store and invoke the hook consistently.
+  memory_store.Put(obj, object_id, /*has_reference=*/true);
+  memory_store.Delete({object_id});
+  ASSERT_EQ(memory_store.GetIfExists(object_id), nullptr);
+  ASSERT_EQ(memory_store.Size(), 0);
+  ASSERT_EQ(unhandled_count, 2);
+
+  // An InPlasmaError value is only an in-process placeholder. Like the vector
+  // Delete overload, DeleteObject must remove that placeholder as well; this is
+  // intentionally different from the Delete overload that reports plasma IDs to
+  // a separate caller.
+  const ObjectID plasma_id = ObjectID::FromRandom();
+  RayObject plasma_obj(rpc::ErrorType::OBJECT_IN_PLASMA);
+  memory_store.Put(plasma_obj, plasma_id, /*has_reference=*/true);
+  ASSERT_NE(memory_store.GetIfExists(plasma_id), nullptr);
+  memory_store.DeleteObject(plasma_id);
+  ASSERT_EQ(memory_store.GetIfExists(plasma_id), nullptr);
+  ASSERT_EQ(memory_store.Size(), 0);
+}
+
 TEST(TestMemoryStore, GetAsyncInvokesWhenObjectArrives) {
   InstrumentedIOContextWithThread io_context("GetAsyncInvokesWhenObjectArrives");
   Clock clock;

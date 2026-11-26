@@ -790,7 +790,11 @@ void ReferenceCounter::DeleteReferenceInternal(ReferenceTable::iterator it,
       // (e.g. a borrower dropped the last reference and we were notified
       // asynchronously). Delete the object's in-process value directly so its
       // memory-store entry does not leak.
-      delete_from_memory_store_({id});
+      //
+      // Pass the ID itself rather than constructing a one-element vector. The
+      // callback is invoked synchronously under mutex_; its contract prohibits
+      // re-entering this non-recursive reference counter.
+      delete_from_memory_store_(id);
     }
 
     auto index_it = reconstructable_owned_objects_index_.find(id);
@@ -1488,7 +1492,12 @@ void ReferenceCounter::SetReleaseLineageCallback(
 }
 
 void ReferenceCounter::SetMemoryStoreDeleteCallback(
-    std::function<void(const std::vector<ObjectID> &)> callback) {
+    std::function<void(const ObjectID &)> callback) {
+  // CoreWorker registers this during construction, before any references can go
+  // out of scope. Taking mutex_ here as well as in DeleteReferenceInternal makes
+  // that initialization contract race-free even if a caller violates it and
+  // attempts registration concurrently with cleanup.
+  absl::MutexLock lock(&mutex_);
   RAY_CHECK(delete_from_memory_store_ == nullptr);
   delete_from_memory_store_ = std::move(callback);
 }

@@ -491,15 +491,24 @@ void CoreWorkerMemoryStore::Delete(const absl::flat_hash_set<ObjectID> &object_i
   }
 }
 
+void CoreWorkerMemoryStore::DeleteObject(const ObjectID &object_id) {
+  absl::MutexLock lock(&mu_);
+  DeleteObjectInternal(object_id);
+}
+
+void CoreWorkerMemoryStore::DeleteObjectInternal(const ObjectID &object_id) {
+  RAY_LOG(DEBUG) << "Delete an object from a memory store. ObjectId: " << object_id;
+  auto it = objects_.find(object_id);
+  if (it != objects_.end()) {
+    OnDelete(it->second);
+    EraseObjectAndUpdateStats(object_id);
+  }
+}
+
 void CoreWorkerMemoryStore::Delete(const std::vector<ObjectID> &object_ids) {
   absl::MutexLock lock(&mu_);
   for (const auto &object_id : object_ids) {
-    RAY_LOG(DEBUG) << "Delete an object from a memory store. ObjectId: " << object_id;
-    auto it = objects_.find(object_id);
-    if (it != objects_.end()) {
-      OnDelete(it->second);
-      EraseObjectAndUpdateStats(object_id);
-    }
+    DeleteObjectInternal(object_id);
   }
 }
 

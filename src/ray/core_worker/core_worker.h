@@ -457,9 +457,9 @@ class CoreWorker : public std::enable_shared_from_this<CoreWorker> {
     reference_counter_->RemoveLocalReference(object_id, &deleted);
     // Delete the in-process value of objects that went out of scope on this
     // call. Internal reference-counter paths that have no `deleted` vector to
-    // report through (e.g. a borrower dropping the last reference) clean up the
-    // memory store themselves via the callback registered in the CoreWorker
-    // constructor (see ReferenceCounter::SetMemoryStoreDeleteCallback).
+    // report through (e.g. a borrower dropping the last reference) synchronously
+    // delete one object at a time through the callback registered in the
+    // CoreWorker constructor (see ReferenceCounter::SetMemoryStoreDeleteCallback).
     memory_store_->Delete(deleted);
   }
 

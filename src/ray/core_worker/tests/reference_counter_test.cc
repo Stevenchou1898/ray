@@ -1418,72 +1418,108 @@ TEST(DistributedReferenceCountTest, TestSimpleBorrowerReferenceRemoved) {
 // reference to an object, the owner learns about it asynchronously through
 // CleanupBorrowersOnRefRemoved, which deletes the reference through an internal
 // path with no caller-provided `deleted` vector. The owner must still delete the
-// object's in-process (memory store) value via the memory-store delete callback,
-// otherwise its memory-store entry leaks.
+// object's real in-process (memory store) value via the memory-store delete
+// callback, otherwise the reference-table entry disappears while its value remains
+// allocated in the store.
+//
+// Recording callback IDs alone is not sufficient: it would pass even if the
+// callback never called CoreWorkerMemoryStore::DeleteObject. This test therefore
+// inserts a real value, checks that it survives every stage where a borrower or
+// submitted task still pins it, and verifies both exactly-once notification and
+// the final store contents after the asynchronous borrower cleanup.
 //
 // The setup mirrors TestSimpleBorrowerReferenceRemoved.
 TEST(DistributedReferenceCountTest, TestMemoryStoreDeletedWhenBorrowerReleasesLast) {
+  // These dependencies must outlive the store. The store keeps non-owning
+  // references to them, so declaring them first also gives them reverse-order
+  // destruction safety.
+  InstrumentedIOContextWithThread io_context("TestMemoryStoreBorrowerCleanup");
+  Clock clock;
+  auto memory_store =
+      std::make_shared<CoreWorkerMemoryStore>(io_context.GetIoService(), clock);
+
   auto borrower = std::make_shared<FakeWorkerClient>("1");
   auto owner = std::make_shared<FakeWorkerClient>(
       "2", [&](const rpc::Address &addr) { return borrower; });
 
-  // Record the objects that the owner's reference counter deletes from its
-  // in-process memory store. Captured through a shared_ptr so it outlives the
-  // owner, whose destructor may still fire the callback.
+  // Keep the notification history in a shared_ptr because FakeWorkerClient's
+  // destructor can release remaining references and invoke this callback after
+  // the test body's local shared_ptr has gone out of scope. The callback uses a
+  // weak store reference, matching CoreWorker's lifetime contract: the store is
+  // declared before owner, so it remains alive for every cleanup in this test.
   auto memory_store_deleted = std::make_shared<std::vector<ObjectID>>();
+  std::weak_ptr<CoreWorkerMemoryStore> weak_memory_store = memory_store;
   owner->rc_.SetMemoryStoreDeleteCallback(
-      [memory_store_deleted](const std::vector<ObjectID> &deleted) {
-        memory_store_deleted->insert(
-            memory_store_deleted->end(), deleted.begin(), deleted.end());
+      [weak_memory_store, memory_store_deleted](const ObjectID &object_id) {
+        memory_store_deleted->push_back(object_id);
+        if (auto store = weak_memory_store.lock()) {
+          store->DeleteObject(object_id);
+        }
       });
   auto count_deleted = [&](const ObjectID &id) {
     return std::count(memory_store_deleted->begin(), memory_store_deleted->end(), id);
   };
 
-  // The owner creates an inner object and wraps it.
+  // Create a real in-process value for inner_id. outer_id only contains the ID;
+  // it does not need its own memory-store entry for this regression.
   auto inner_id = ObjectID::FromRandom();
   auto outer_id = ObjectID::FromRandom();
+  uint8_t data[] = {1, 2, 3, 4};
+  RayObject buffer(std::make_shared<LocalMemoryBuffer>(data, sizeof(data)), nullptr, {});
   owner->Put(inner_id);
   owner->PutWrappedId(outer_id, inner_id);
+  memory_store->Put(buffer, inner_id, /*has_reference=*/true);
+  ASSERT_NE(memory_store->GetIfExists(inner_id), nullptr);
+  ASSERT_EQ(memory_store->Size(), 1);
+  ASSERT_EQ(count_deleted(inner_id), 0);
 
   // The owner submits a task that depends on the outer object. The task will be
   // given a reference to inner_id.
   auto return_id = owner->SubmitTaskWithArg(outer_id);
   // The owner's local references go out of scope, but both objects stay pinned
-  // because the task is still borrowing them.
+  // because the submitted task still depends on them. Internal cleanup must not
+  // delete inner_id's value at this point.
   owner->rc_.RemoveLocalReference(outer_id, nullptr);
   owner->rc_.RemoveLocalReference(inner_id, nullptr);
   ASSERT_TRUE(owner->rc_.HasReference(outer_id));
   ASSERT_TRUE(owner->rc_.HasReference(inner_id));
+  ASSERT_NE(memory_store->GetIfExists(inner_id), nullptr);
+  ASSERT_EQ(count_deleted(inner_id), 0);
 
   // The borrower is given a reference to the inner object.
   borrower->ExecuteTaskWithArg(outer_id, inner_id, owner->address_);
   ASSERT_TRUE(borrower->rc_.HasReference(inner_id));
 
   // The borrower task returns to the owner while still using inner_id, and the
-  // owner merges the borrower's ref count into its own.
+  // owner merges the borrower's ref count into its own. The owner now knows that
+  // inner_id is borrowed, so the value must remain available.
   auto borrower_refs = borrower->FinishExecutingTask(outer_id, ObjectID::Nil());
   owner->HandleSubmittedTaskFinished(
       return_id, outer_id, {}, borrower->address_, borrower_refs);
   ASSERT_TRUE(owner->rc_.HasReference(inner_id));
-  // inner_id is still borrowed, so it must not have been deleted from the
-  // owner's memory store yet.
+  ASSERT_NE(memory_store->GetIfExists(inner_id), nullptr);
   ASSERT_EQ(count_deleted(inner_id), 0);
 
-  // The borrower drops the last reference to inner_id. The owner still holds its
-  // reference until it hears back from the borrower.
+  // The borrower drops its last local reference. The owner still holds its
+  // reference until the asynchronous wait-for-ref-removed reply arrives, so this
+  // local release alone must not delete the owner's value.
   borrower->rc_.RemoveLocalReference(inner_id, nullptr);
   ASSERT_TRUE(owner->rc_.HasReference(inner_id));
+  ASSERT_NE(memory_store->GetIfExists(inner_id), nullptr);
   ASSERT_EQ(count_deleted(inner_id), 0);
 
-  // The borrower notifies the owner that it is no longer using inner_id. The
-  // owner's reference now goes out of scope through CleanupBorrowersOnRefRemoved.
+  // FlushBorrowerCallbacks delivers the borrower's final ref count to the owner.
+  // CleanupBorrowersOnRefRemoved then reaches DeleteReferenceInternal with a null
+  // `deleted` vector, which is the internal path that used to leak the value.
   borrower->FlushBorrowerCallbacks();
   ASSERT_FALSE(owner->rc_.HasReference(inner_id));
 
-  // Even though the borrower released last, the owner must have deleted inner_id
-  // from its in-process memory store.
-  ASSERT_GT(count_deleted(inner_id), 0);
+  // The callback must run exactly once for inner_id and must remove the actual
+  // store entry, not merely report the ID. Checking Size() also proves that no
+  // unrelated placeholder or value was left behind by the nested cleanup.
+  ASSERT_EQ(count_deleted(inner_id), 1);
+  ASSERT_EQ(memory_store->GetIfExists(inner_id), nullptr);
+  ASSERT_EQ(memory_store->Size(), 0);
 }
 
 // A borrower is given a reference to an object ID, passes the reference to

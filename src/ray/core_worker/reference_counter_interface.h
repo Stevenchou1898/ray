@@ -454,8 +454,8 @@ class ReferenceCounterInterface {
   virtual void SetReleaseLineageCallback(const LineageReleasedCallback &callback) = 0;
 
   /**
-   * @brief Set a callback that deletes the in-process (memory store) value of
-   * objects that go out of scope through internal code paths.
+   * @brief Register the callback used to delete in-process values for objects
+   * that go out of scope through internal code paths.
    *
    * Most public methods report out-of-scope objects through a caller-provided
    * `deleted` vector, and the caller (the core worker) deletes those objects
@@ -463,14 +463,26 @@ class ReferenceCounterInterface {
    * through internal paths that have no caller to hand a `deleted` vector to,
    * e.g. when a borrower drops the last reference and the owner is notified
    * asynchronously. Without this callback, the owner's memory-store entry for
-   * such objects would leak. The core worker sets this callback so the
-   * reference counter can delete those entries itself.
+   * such objects would leak.
    *
-   * @param[in] callback Called with the IDs of objects that went out of scope
-   * and whose in-process values should be deleted.
+   * The callback has the following contract:
+   * 1. It is registered exactly once during initialization, before any object
+   *    can go out of scope. Implementations serialize registration with callback
+   *    invocation so a late registration cannot race with an internal cleanup.
+   * 2. It is invoked synchronously by DeleteReferenceInternal while the
+   *    reference counter's non-recursive mutex is held. It must not call back
+   *    into the reference counter and must not block waiting for work that needs
+   *    the same mutex.
+   * 3. It receives one ObjectID at a time. Internal cleanup is a hot path, and
+   *    passing a single ID avoids constructing a temporary one-element vector.
+   * 4. It is not invoked when the caller supplied a `deleted` vector; that
+   *    caller remains responsible for deleting the reported values.
+   *
+   * @param[in] callback Called with each object ID whose in-process value should
+   * be deleted by an internal reference-counter path.
    */
   virtual void SetMemoryStoreDeleteCallback(
-      std::function<void(const std::vector<ObjectID> &)> callback) = 0;
+      std::function<void(const ObjectID &)> callback) = 0;
 
   /**
    * @brief Just calls PublishRefRemovedInternal with a lock.

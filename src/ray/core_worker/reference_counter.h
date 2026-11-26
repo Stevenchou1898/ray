@@ -168,8 +168,8 @@ class ReferenceCounter : public ReferenceCounterInterface,
 
   void SetReleaseLineageCallback(const LineageReleasedCallback &callback) override;
 
-  void SetMemoryStoreDeleteCallback(
-      std::function<void(const std::vector<ObjectID> &)> callback) override;
+  void SetMemoryStoreDeleteCallback(std::function<void(const ObjectID &)> callback)
+      override ABSL_LOCKS_EXCLUDED(mutex_);
 
   void PublishRefRemoved(const ObjectID &object_id) override ABSL_LOCKS_EXCLUDED(mutex_);
 
@@ -784,10 +784,14 @@ class ReferenceCounter : public ReferenceCounterInterface,
   LineageReleasedCallback on_lineage_released_;
   /// The callback to delete the in-process (memory store) value of objects that
   /// go out of scope through internal paths that cannot report them through a
-  /// caller-provided `deleted` vector. Set by the core worker. It is not
-  /// guarded by a lock because it is set once during initialization, before any
-  /// object can go out of scope.
-  std::function<void(const std::vector<ObjectID> &)> delete_from_memory_store_;
+  /// caller-provided `deleted` vector. Set by the core worker during
+  /// initialization, before any object can go out of scope.
+  ///
+  /// Registration and invocation are both protected by mutex_. Invocation is
+  /// synchronous while the non-recursive mutex is held, so the callback must not
+  /// re-enter ReferenceCounter. A single ObjectID is passed to avoid allocating a
+  /// temporary vector for every internally deleted object.
+  std::function<void(const ObjectID &)> delete_from_memory_store_ ABSL_GUARDED_BY(mutex_);
   /// Optional shutdown hook to call when all references have gone
   /// out of scope.
   std::function<void()> shutdown_hook_ ABSL_GUARDED_BY(mutex_) = nullptr;

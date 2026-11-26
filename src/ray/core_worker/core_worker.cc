@@ -492,11 +492,29 @@ CoreWorker::CoreWorker(
   // have no caller to hand a `deleted` vector to (e.g. when a borrower drops the
   // last reference and this owner is notified asynchronously). Let the reference
   // counter delete those objects' in-process values itself so the memory-store
-  // entries do not leak. Capture the memory store by value so the callback stays
-  // valid for as long as the reference counter holds it.
+  // entries do not leak.
+  //
+  // Registration happens after both shared_ptr members are initialized and
+  // before task receivers can deliver work. The callback runs synchronously under
+  // the reference counter mutex, so it must not re-enter the reference counter.
+  // DeleteObject only takes the memory-store lock and uses the existing deletion
+  // hook; it does not wait for reference-counter work.
+  //
+  // Do not extend the store's lifetime from this callback. CoreWorker owns the
+  // store during normal operation and drains shutdown before its members are
+  // destroyed, while the store itself holds non-owning references to CoreWorker
+  // dependencies such as the IO context and clock. A weak reference also makes a
+  // late cleanup safe if another shared owner keeps the reference counter alive
+  // after CoreWorker destruction: in that case the store and all of its entries
+  // are already gone, so there is nothing left to delete.
+  std::weak_ptr<CoreWorkerMemoryStore> weak_memory_store = memory_store_;
   reference_counter_->SetMemoryStoreDeleteCallback(
-      [memory_store = memory_store_](const std::vector<ObjectID> &deleted) {
-        memory_store->Delete(deleted);
+      [weak_memory_store](const ObjectID &object_id) {
+        if (auto store = weak_memory_store.lock()) {
+          // Use the single-ID entry point. Calling Delete({object_id}) here would
+          // still allocate a temporary vector and defeat the hot-path fix.
+          store->DeleteObject(object_id);
+        }
       });
   RAY_CHECK(RayConfig::instance().max_free_local_objects_batch_size() > 0)
       << "max_free_local_objects_batch_size must be positive, got "

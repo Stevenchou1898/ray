@@ -152,6 +152,17 @@ class CoreWorkerMemoryStore {
   void Delete(const absl::flat_hash_set<ObjectID> &object_ids,
               absl::flat_hash_set<ObjectID> *plasma_ids_to_delete);
 
+  /// Delete a single object from the object store without constructing a
+  /// temporary container of object IDs.
+  ///
+  /// This has the same deletion semantics as the vector overload below: an
+  /// absent object ID is a no-op, and an in-process value is removed even when
+  /// it is an InPlasmaError placeholder. Internal reference-counter cleanup uses
+  /// this entry point because it reports one out-of-scope object at a time.
+  ///
+  /// \param[in] object_id ID of the object to delete.
+  void DeleteObject(const ObjectID &object_id);
+
   /// Delete a list of objects from the object store.
   ///
   /// \param[in] object_ids IDs of the objects to delete.
@@ -214,6 +225,16 @@ class CoreWorkerMemoryStore {
 
   /// Called when an object is deleted from the store.
   void OnDelete(std::shared_ptr<RayObject> obj);
+
+  /// Delete one object after the caller has acquired mu_.
+  ///
+  /// Keeping this operation in a shared helper gives DeleteObject and the vector
+  /// Delete overload identical lookup, notification, and statistics behavior.
+  /// The vector overload takes the lock once for the whole batch, while the
+  /// single-object entry point avoids any temporary ID container.
+  ///
+  /// \param[in] object_id ID of the object to delete.
+  void DeleteObjectInternal(const ObjectID &object_id) ABSL_EXCLUSIVE_LOCKS_REQUIRED(mu_);
 
   /// Emplace the given object entry to the in-memory-store and update stats properly.
   void EmplaceObjectAndUpdateStats(const ObjectID &object_id,
